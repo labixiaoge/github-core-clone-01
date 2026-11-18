@@ -45,18 +45,23 @@ function peeledOid(repo: Repo, refName: string, oid: string): string | null {
 
 // ---------------------------------------------------------------- advertisements
 
-/** v2 capability advertisement (info/refs with Git-Protocol: version=2). */
+/** v2 capability advertisement (info/refs with Git-Protocol: version=2). The bytes are
+ * fixed for every repository, so they are built once at module load instead of
+ * re-encoded on every info/refs (the clone workload issues 50 of them). The buffer
+ * is never mutated after creation, so returning the shared instance is safe. */
+const UPLOAD_PACK_V2_ADVERTISEMENT: Buffer = encodePktLines([
+  '# service=git-upload-pack\n',
+  'flush',
+  'version 2\n',
+  'ls-refs=unborn\n',
+  'fetch=shallow\n',
+  'object-format=sha1\n',
+  `agent=${AGENT}\n`,
+  'flush',
+]);
+
 export function advertiseUploadPackV2(): Buffer {
-  return encodePktLines([
-    '# service=git-upload-pack\n',
-    'flush',
-    'version 2\n',
-    'ls-refs=unborn\n',
-    'fetch=shallow\n',
-    'object-format=sha1\n',
-    `agent=${AGENT}\n`,
-    'flush',
-  ]);
+  return UPLOAD_PACK_V2_ADVERTISEMENT;
 }
 
 /** v0 ref advertisement for upload-pack (info/refs without the v2 header). */

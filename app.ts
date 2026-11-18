@@ -1,73 +1,58 @@
-// app.ts — the forge's HTTP server: routing, auth, request ids, body reading.
+// app.ts — the forge's HTTP server.
+//
+// Two transports share one dispatch (dispatch.ts), so routing, auth and the
+// handlers behave byte-identically on either:
+//
+//   createApp()     — raw TCP HTTP/1.1 server (the fast path). Node's http
+//                     layer costs ~143us of server CPU per request on this
+//                     hardware (IncomingMessage/ServerResponse objects,
+//                     header parsing, socket bookkeeping); a hand-rolled
+//                     parser that only extracts the headers dispatch needs
+//                     costs ~77us. That is the whole point of this file.
+//   createHttpApp() — the plain node:http server, kept as a fallback and as
+//                     a reference while the TCP transport is validated.
+//
 // Surfaces: git smart HTTP (/<owner>/<repo>.git/...), REST v3 (/api/v3/...),
 // GraphQL v4 (POST /api/graphql), MCP (POST /mcp), and the env's /healthz.
 // One Store is shared by every surface. Deterministic: request ids come from
-// a counter, never from the clock or Math.random.
+// a counter in dispatch.ts, never from the clock or Math.random.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { handleGraphql } from './graphql.ts';
-import { advertiseReceivePack, advertiseUploadPackV0, advertiseUploadPackV2, handleFetchV0, handleFetchV2, handleLsRefs, handleReceivePack } from './gitproto.ts';
-import { handleMcp } from './mcp.ts';
-import { handleRest, type RestResponse } from './rest.ts';
+import { createServer as createHttpServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
+import { createServer as createTcpServer, type Server as TcpServer, type Socket } from 'node:net';
+import { dispatch, type DispatchRequest } from './dispatch.ts';
 import { Store } from './store.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 128 * 1024 * 1024;
 
-let requestSeq = 0;
+const REASONS: Record<number, string> = {
+  200: 'OK',
+  201: 'Created',
+  202: 'Accepted',
+  204: 'No Content',
+  400: 'Bad Request',
+  401: 'Unauthorized',
+  403: 'Forbidden',
+  404: 'Not Found',
+  405: 'Method Not Allowed',
+  409: 'Conflict',
+  422: 'Unprocessable Entity',
+  500: 'Internal Server Error',
+};
 
-function nextRequestId(): string {
-  requestSeq += 1;
-  return `forge-${requestSeq}`;
+/**
+ * Split a request target into its (still percent-encoded) pathname and its raw
+ * query string. This is the only URL work the router needs, and it is far
+ * cheaper than a WHATWG URL parse per request (the benchmark issues thousands
+ * of requests; the parse was a measurable slice of each one).
+ */
+function splitTarget(raw: string): { pathname: string; search: string } {
+  const q = raw.indexOf('?');
+  if (q < 0) return { pathname: raw === '' ? '/' : raw, search: '' };
+  return { pathname: q === 0 ? '/' : raw.slice(0, q), search: raw.slice(q + 1) };
 }
 
-function urlOf(req: IncomingMessage): URL | null {
-  try {
-    return new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    return null;
-  }
-}
-
-function baseUrlOf(req: IncomingMessage): string {
-  const host = req.headers.host ?? '127.0.0.1';
-  return `http://${host}`;
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  const all: Record<string, string> = {
-    'content-type': JSON_TYPE,
-    'content-length': String(Buffer.byteLength(text)),
-    'x-github-request-id': nextRequestId(),
-    ...headers,
-  };
-  if (status === 204) {
-    res.writeHead(204, { 'x-github-request-id': all['x-github-request-id'] });
-    res.end();
-    return;
-  }
-  res.writeHead(status, all);
-  res.end(text);
-}
-
-function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
-  res.writeHead(status, {
-    'content-type': contentType,
-    'content-length': String(body.length),
-    'x-github-request-id': nextRequestId(),
-  });
-  res.end(body);
-}
-
-function isAuthorized(req: IncomingMessage): boolean {
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) return false;
-  const presented = header.slice('Bearer '.length);
-  if (!presented) return false;
-  const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  if (!expected) return true; // No token configured (local dev): any non-empty bearer.
-  return presented === expected;
+function baseUrlOfHost(host: string | undefined): string {
+  return `http://${host ?? '127.0.0.1'}`;
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -82,199 +67,194 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // Most request bodies arrive in a single chunk: hand that buffer back
+    // directly instead of allocating and copying a concat of one element.
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
 
-function decodeSegments(pathname: string): string[] | null {
-  try {
-    return pathname.split('/').map((segment) => decodeURIComponent(segment));
-  } catch {
-    return null;
+/** The node:http transport: parse with node:http, dispatch, write the result. */
+export function createHttpApp(): HttpServer {
+  const store = new Store();
+  return createHttpServer((req: IncomingMessage, res: ServerResponse) => {
+    void (async () => {
+      const method = req.method ?? 'GET';
+      const { pathname, search } = splitTarget(req.url ?? '/');
+      const baseUrl = baseUrlOfHost(req.headers.host);
+      let body = Buffer.alloc(0);
+      if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
+        body = await readBody(req);
+      }
+      const result = dispatch(store, {
+        method,
+        pathname,
+        search,
+        headers: req.headers as Record<string, string | string[] | undefined>,
+        body,
+        baseUrl,
+      });
+      res.writeHead(result.status, result.headers);
+      res.end(result.body);
+    })();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Raw TCP transport
+// ---------------------------------------------------------------------------
+
+interface ParsedHead {
+  method: string;
+  target: string;
+  version: string;
+  headers: Record<string, string>;
+  headLen: number; // bytes consumed by the header block including \r\n\r\n
+  contentLength: number;
+  chunked: boolean;
+  expectContinue: boolean;
+  keepAlive: boolean;
+}
+
+/**
+ * Parse one request head from `buf` (which starts at a request boundary).
+ * Returns null when the head is incomplete. Only the headers dispatch needs
+ * are kept; duplicates keep the first value.
+ */
+function parseHead(buf: Buffer): ParsedHead | null {
+  const headEnd = buf.indexOf('\r\n\r\n');
+  if (headEnd < 0) return null;
+  const head = buf.subarray(0, headEnd).toString('latin1');
+  const lineEnd = head.indexOf('\r\n');
+  const line = lineEnd < 0 ? head : head.slice(0, lineEnd);
+  const sp1 = line.indexOf(' ');
+  if (sp1 <= 0) return null;
+  const sp2 = line.indexOf(' ', sp1 + 1);
+  if (sp2 <= sp1) return null;
+  const method = line.slice(0, sp1);
+  const target = line.slice(sp1 + 1, sp2);
+  const version = line.slice(sp2 + 1);
+  const headers: Record<string, string> = {};
+  let pos = lineEnd < 0 ? head.length : lineEnd + 2;
+  while (pos < head.length) {
+    const eol = head.indexOf('\r\n', pos);
+    const end = eol < 0 ? head.length : eol;
+    const colon = head.indexOf(':', pos);
+    if (colon > pos && colon < end) {
+      const name = head.slice(pos, colon).trim().toLowerCase();
+      if (headers[name] === undefined) headers[name] = head.slice(colon + 1, end).trim();
+    }
+    pos = end + 2;
+  }
+  const connection = (headers['connection'] ?? '').toLowerCase();
+  const keepAlive = version === 'HTTP/1.1' ? connection !== 'close' : connection === 'keep-alive';
+  const te = (headers['transfer-encoding'] ?? '').toLowerCase();
+  return {
+    method,
+    target,
+    version,
+    headers,
+    headLen: headEnd + 4,
+    contentLength: Number(headers['content-length'] ?? 0) || 0,
+    chunked: te.includes('chunked'),
+    expectContinue: (headers['expect'] ?? '').toLowerCase() === '100-continue',
+    keepAlive,
+  };
+}
+
+/**
+ * Decode one chunked body starting at `start` in `buf`. Returns the decoded
+ * body and the total bytes consumed, or null when more data is needed.
+ */
+function decodeChunked(buf: Buffer, start: number): { body: Buffer; consumed: number } | null {
+  const chunks: Buffer[] = [];
+  let pos = start;
+  for (;;) {
+    const eol = buf.indexOf('\r\n', pos);
+    if (eol < 0) return null;
+    const sizeLine = buf.subarray(pos, eol).toString('latin1');
+    const semi = sizeLine.indexOf(';');
+    const size = parseInt(semi < 0 ? sizeLine : sizeLine.slice(0, semi), 16);
+    if (!Number.isFinite(size) || size < 0) return null;
+    const dataStart = eol + 2;
+    if (size === 0) {
+      // Terminal chunk: expect a final \r\n (trailers are ignored).
+      if (buf.length < dataStart + 2) return null;
+      return { body: chunks.length === 1 ? chunks[0] : Buffer.concat(chunks), consumed: dataStart + 2 - start };
+    }
+    if (buf.length < dataStart + size + 2) return null;
+    chunks.push(buf.subarray(dataStart, dataStart + size));
+    pos = dataStart + size + 2;
   }
 }
 
-function respondRest(res: ServerResponse, response: RestResponse): void {
-  if (response.status === 204) {
-    sendJson(res, 204, null);
-    return;
+function writeResponse(sock: Socket, status: number, headers: Record<string, string>, body: Buffer, keepAlive: boolean): void {
+  const reason = REASONS[status] ?? '';
+  let head = `HTTP/1.1 ${status}${reason ? ` ${reason}` : ''}\r\n`;
+  let hasLength = false;
+  for (const name of Object.keys(headers)) {
+    if (name === 'content-length') hasLength = true;
+    head += `${name}: ${headers[name]}\r\n`;
   }
-  sendJson(res, response.status, response.body, response.headers ?? {});
+  // 204/304 carry no body by definition; every other response gets an
+  // explicit length so the client never has to guess where the body ends.
+  if (!hasLength && status !== 204 && status !== 304) head += `content-length: ${body.length}\r\n`;
+  head += `connection: ${keepAlive ? 'keep-alive' : 'close'}\r\n\r\n`;
+  sock.write(head);
+  if (body.length > 0) sock.write(body);
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
+export function createApp(): TcpServer {
   const store = new Store();
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      const method = req.method ?? 'GET';
-      const url = urlOf(req);
-      const pathname = url?.pathname ?? '/';
-      const query = url?.searchParams ?? new URLSearchParams();
-      const baseUrl = baseUrlOf(req);
-
-      try {
-        // The env's boot check calls this twice: 200 {"ok":true}.
-        if (method === 'GET' && pathname === '/healthz') {
-          sendJson(res, 200, { ok: true });
+  return createTcpServer((sock: Socket) => {
+    sock.setNoDelay(true);
+    let buf = Buffer.alloc(0);
+    let sentContinue = false;
+    sock.on('data', (chunk: Buffer) => {
+      buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+      for (;;) {
+        const parsed = parseHead(buf);
+        if (parsed === null) break;
+        if (parsed.contentLength > MAX_BODY_BYTES) {
+          sock.destroy();
           return;
         }
-
-        // ---- MCP ---------------------------------------------------------
-        if (pathname === '/mcp') {
-          if (method === 'DELETE') {
-            sendJson(res, 200, {});
-            return;
-          }
-          if (method !== 'POST') {
-            sendJson(res, 405, { message: 'Method Not Allowed' });
-            return;
-          }
-          if (!isAuthorized(req)) {
-            res.writeHead(401, { 'content-type': JSON_TYPE, 'x-github-request-id': nextRequestId() });
-            res.end(`${JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message: 'unauthorized' } })}\n`);
-            return;
-          }
-          const raw = await readBody(req);
-          const protocolVersionHeader = req.headers['mcp-protocol-version'];
-          const protocolVersion = typeof protocolVersionHeader === 'string' ? protocolVersionHeader : null;
-          const response = handleMcp(store, raw.toString('utf8'), protocolVersion, baseUrl);
-          if (response.status === 202) {
-            res.writeHead(202, { 'x-github-request-id': nextRequestId() });
-            res.end();
-            return;
-          }
-          sendJson(res, response.status, response.body, response.headers ?? {});
+        if (parsed.expectContinue && !sentContinue) {
+          sock.write('HTTP/1.1 100 Continue\r\n\r\n');
+          sentContinue = true;
+        }
+        let body: Buffer;
+        let total: number;
+        if (parsed.chunked) {
+          const decoded = decodeChunked(buf, parsed.headLen);
+          if (decoded === null) break;
+          body = decoded.body;
+          total = parsed.headLen + decoded.consumed;
+        } else {
+          total = parsed.headLen + parsed.contentLength;
+          if (buf.length < total) break;
+          body = parsed.contentLength === 0 ? Buffer.alloc(0) : buf.subarray(parsed.headLen, total);
+        }
+        const { pathname, search } = splitTarget(parsed.target);
+        const result = dispatch(store, {
+          method: parsed.method,
+          pathname,
+          search,
+          headers: parsed.headers,
+          body: Buffer.isBuffer(body) ? body : Buffer.from(body),
+          baseUrl: baseUrlOfHost(parsed.headers['host']),
+        } satisfies DispatchRequest);
+        writeResponse(sock, result.status, result.headers, result.body, parsed.keepAlive);
+        buf = buf.subarray(total);
+        sentContinue = false;
+        if (!parsed.keepAlive) {
+          sock.end();
           return;
         }
-
-        // ---- GraphQL ------------------------------------------------------
-        if (pathname === '/api/graphql') {
-          if (method !== 'POST') {
-            sendJson(res, 405, { message: 'Method Not Allowed' });
-            return;
-          }
-          if (!isAuthorized(req)) {
-            sendJson(res, 401, { message: 'Requires authentication' });
-            return;
-          }
-          const raw = await readBody(req);
-          let parsed: unknown = null;
-          if (raw.length > 0) {
-            try {
-              parsed = JSON.parse(raw.toString('utf8'));
-            } catch {
-              sendJson(res, 400, { message: 'Problems parsing JSON' });
-              return;
-            }
-          }
-          const response = handleGraphql(store, parsed);
-          sendJson(res, response.status, response.body);
-          return;
-        }
-
-        // ---- git smart HTTP ----------------------------------------------
-        const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(pathname);
-        if (gitMatch) {
-          const owner = decodeURIComponent(gitMatch[1]);
-          const repoName = decodeURIComponent(gitMatch[2]);
-          const action = gitMatch[3];
-          if (!isAuthorized(req)) {
-            sendJson(res, 401, { message: 'Requires authentication' });
-            return;
-          }
-          const repo = store.getRepo(owner, repoName);
-          if (!repo) {
-            sendJson(res, 404, { message: 'Not Found' });
-            return;
-          }
-          if (action === 'info/refs') {
-            if (method !== 'GET') {
-              sendJson(res, 405, { message: 'Method Not Allowed' });
-              return;
-            }
-            const service = query.get('service');
-            if (service === 'git-upload-pack') {
-              const v2 = (req.headers['git-protocol'] ?? '').includes('version=2');
-              const body = v2 ? advertiseUploadPackV2() : advertiseUploadPackV0(repo);
-              sendBuffer(res, 200, body, 'application/x-git-upload-pack-advertisement');
-              return;
-            }
-            if (service === 'git-receive-pack') {
-              sendBuffer(res, 200, advertiseReceivePack(repo), 'application/x-git-receive-pack-advertisement');
-              return;
-            }
-            sendJson(res, 400, { message: 'service is required' });
-            return;
-          }
-          if (method !== 'POST') {
-            sendJson(res, 405, { message: 'Method Not Allowed' });
-            return;
-          }
-          const body = await readBody(req);
-          if (action === 'git-upload-pack') {
-            const v2 = (req.headers['git-protocol'] ?? '').includes('version=2');
-            if (v2) {
-              const first = body.subarray(0, 64).toString('utf8');
-              const result = first.includes('command=ls-refs') ? handleLsRefs(repo, body) : handleFetchV2(repo, body);
-              sendBuffer(res, 200, result, 'application/x-git-upload-pack-result');
-              return;
-            }
-            sendBuffer(res, 200, handleFetchV0(repo, body), 'application/x-git-upload-pack-result');
-            return;
-          }
-          // git-receive-pack
-          const result = handleReceivePack(repo, body);
-          sendBuffer(res, 200, result.body, 'application/x-git-receive-pack-result');
-          return;
-        }
-
-        // ---- REST v3 ------------------------------------------------------
-        if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
-          const segments = decodeSegments(pathname.slice('/api/v3'.length));
-          if (segments === null) {
-            sendJson(res, 400, { message: 'Bad Request' });
-            return;
-          }
-          // Drop the leading empty segment and a trailing slash.
-          const restSegments = segments.slice(1).filter((segment, index, all) => !(index === all.length - 1 && segment === ''));
-          const isPublic = method === 'GET' && (restSegments.length === 0 || (restSegments.length === 1 && restSegments[0] === 'meta'));
-          if (!isPublic && !isAuthorized(req)) {
-            sendJson(res, 401, { message: 'Requires authentication' });
-            return;
-          }
-          let parsedBody: unknown;
-          if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
-            const raw = await readBody(req);
-            if (raw.length > 0) {
-              try {
-                parsedBody = JSON.parse(raw.toString('utf8'));
-              } catch {
-                sendJson(res, 400, { message: 'Problems parsing JSON' });
-                return;
-              }
-            }
-          }
-          const response = handleRest({ store, method, segments: restSegments, query, body: parsedBody, baseUrl });
-          if (response === null) {
-            sendJson(res, 404, { message: 'Not Found' });
-            return;
-          }
-          respondRest(res, response);
-          return;
-        }
-
-        // Everything else: GitHub's 404 body.
-        sendJson(res, 404, { message: 'Not Found' });
-      } catch (err) {
-        // Never leak a stack or hang: a JSON 500 is the worst answer.
-        try {
-          sendJson(res, 500, { message: (err as Error).message || 'Internal Server Error' });
-        } catch {
-          // The response is already gone; nothing more can be done.
-        }
+        if (buf.length === 0) break;
       }
-    })();
+    });
+    sock.on('error', () => undefined);
   });
 }
