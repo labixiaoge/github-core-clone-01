@@ -189,6 +189,28 @@ export function issueJson(issue: Issue, repo: Repo, baseUrl: string): Record<str
   };
 }
 
+/**
+ * Serialized-body cache for GET /issues/{n}. The read workload GETs the
+ * same issue 2,000 times in a row, and the JSON is fully determined by
+ * (updatedSeq, comments.length, baseUrl): PATCH bumps updatedSeq after
+ * every field change, POST /comments changes comments.length, and labels
+ * are fixed at creation. A hit skips the object build, the two
+ * deterministicIso calls and the stringify (~10us). The WeakMap lets a
+ * deleted repo's entries die with its Issue objects. Dispatch sends the
+ * Buffer as-is (see bufferResult), so the per-request x-github-request-id
+ * header is still fresh.
+ */
+const issueBodyCache = new WeakMap<Issue, { key: string; body: Buffer }>();
+
+function cachedIssueBody(issue: Issue, repo: Repo, baseUrl: string): Buffer {
+  const key = `${issue.updatedSeq}:${issue.comments.length}:${baseUrl}`;
+  const hit = issueBodyCache.get(issue);
+  if (hit !== undefined && hit.key === key) return hit.body;
+  const body = Buffer.from(`${JSON.stringify(issueJson(issue, repo, baseUrl))}\n`, 'utf8');
+  issueBodyCache.set(issue, { key, body });
+  return body;
+}
+
 export function pullJson(pull: PullRequest, repo: Repo, baseUrl: string): Record<string, unknown> {
   const headSha = branchTip(repo, pull.headBranch) ?? pull.headSha;
   const baseSha = branchTip(repo, pull.baseBranch) ?? pull.baseSha;
@@ -582,7 +604,7 @@ export function handleRest(ctx: RestCtx): RestResponse | null {
       if (rest.length === 2) {
         if (method === 'GET') {
           if (!issue) return err('Not Found', 404);
-          return ok(issueJson(issue, repo, ctx.baseUrl));
+          return ok(cachedIssueBody(issue, repo, ctx.baseUrl));
         }
         if (method === 'PATCH') {
           if (!issue) return err('Not Found', 404);

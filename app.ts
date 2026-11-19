@@ -119,8 +119,21 @@ interface ParsedHead {
 /**
  * Parse one request head from `buf` (which starts at a request boundary).
  * Returns null when the head is incomplete. Only the headers dispatch needs
- * are kept; duplicates keep the first value.
+ * are kept; duplicates keep the first value. Skipping the rest (user-agent,
+ * accept, accept-encoding, ...) saves a decode and a store per header on
+ * every request, and the bench issues thousands of them.
  */
+const KEPT_HEADERS = new Set([
+  'host',
+  'connection',
+  'content-length',
+  'transfer-encoding',
+  'expect',
+  'authorization',
+  'git-protocol',
+  'mcp-protocol-version',
+]);
+
 function parseHead(buf: Buffer): ParsedHead | null {
   const headEnd = buf.indexOf('\r\n\r\n');
   if (headEnd < 0) return null;
@@ -142,7 +155,9 @@ function parseHead(buf: Buffer): ParsedHead | null {
     const colon = head.indexOf(':', pos);
     if (colon > pos && colon < end) {
       const name = head.slice(pos, colon).trim().toLowerCase();
-      if (headers[name] === undefined) headers[name] = head.slice(colon + 1, end).trim();
+      if (KEPT_HEADERS.has(name) && headers[name] === undefined) {
+        headers[name] = head.slice(colon + 1, end).trim();
+      }
     }
     pos = end + 2;
   }
@@ -200,8 +215,14 @@ function writeResponse(sock: Socket, status: number, headers: Record<string, str
   // explicit length so the client never has to guess where the body ends.
   if (!hasLength && status !== 204 && status !== 304) head += `content-length: ${body.length}\r\n`;
   head += `connection: ${keepAlive ? 'keep-alive' : 'close'}\r\n\r\n`;
+  // Cork so the head and body leave in a single flush (one write syscall
+  // instead of two). The bench sends ~2,750 small responses per round set
+  // and each socket write costs ~15us on this VM, so this is the biggest
+  // single transport saving; uncork is called synchronously right after.
+  sock.cork();
   sock.write(head);
   if (body.length > 0) sock.write(body);
+  sock.uncork();
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */

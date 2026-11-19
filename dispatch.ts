@@ -58,16 +58,18 @@ function jsonResult(status: number, body: unknown, extra: Record<string, string>
   if (status === 204) {
     return { status, headers: { 'x-github-request-id': id, ...extra }, body: Buffer.alloc(0) };
   }
-  const text = `${JSON.stringify(body)}\n`;
+  // One Buffer.from instead of Buffer.byteLength + Buffer.from: the length
+  // comes from the buffer itself, and every JSON response pays this.
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   return {
     status,
     headers: {
       'content-type': JSON_TYPE,
-      'content-length': String(Buffer.byteLength(text)),
+      'content-length': String(buf.length),
       'x-github-request-id': id,
       ...extra,
     },
-    body: Buffer.from(text, 'utf8'),
+    body: buf,
   };
 }
 
@@ -101,8 +103,12 @@ function isAuthorized(headers: Record<string, string | string[] | undefined>): b
 }
 
 function decodeSegments(pathname: string): string[] | null {
+  const parts = pathname.split('/');
+  // The bench's REST paths never carry a percent-escape; skipping
+  // decodeURIComponent per segment saves a call per segment.
+  if (pathname.indexOf('%') < 0) return parts;
   try {
-    return pathname.split('/').map((segment) => decodeURIComponent(segment));
+    return parts.map((segment) => decodeURIComponent(segment));
   } catch {
     return null;
   }
@@ -110,8 +116,18 @@ function decodeSegments(pathname: string): string[] | null {
 
 function respondRest(response: RestResponse): DispatchResult {
   if (response.status === 204) return jsonResult(204, null);
+  // A Buffer body is already serialized (the GET-issue cache in rest.ts);
+  // send it as-is instead of re-stringifying it.
+  if (Buffer.isBuffer(response.body)) {
+    return bufferResult(response.status, response.body, JSON_TYPE);
+  }
   return jsonResult(response.status, response.body, response.headers ?? {});
 }
+
+/** Shared empty query: dispatch never mutates ctx.query, and the bench's
+ * git/read/write requests carry no query string, so one allocation is saved
+ * per request. */
+const EMPTY_QUERY = new URLSearchParams();
 
 /**
  * Dispatch one request. `store` is the shared Store; `req` is the parsed
@@ -121,7 +137,7 @@ function respondRest(response: RestResponse): DispatchResult {
 export function dispatch(store: Store, req: DispatchRequest): DispatchResult {
   const { method, pathname, search } = req;
   const headers = req.headers;
-  const query = new URLSearchParams(search);
+  const query = search === '' ? EMPTY_QUERY : new URLSearchParams(search);
   try {
     // The env's boot check calls this twice: 200 {"ok":true}.
     if (method === 'GET' && pathname === '/healthz') {
@@ -171,7 +187,11 @@ export function dispatch(store: Store, req: DispatchRequest): DispatchResult {
     }
 
     // ---- git smart HTTP ----------------------------------------------
-    const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(pathname);
+    // Fast path: the regex is only worth running when the path actually
+    // contains a .git/ segment (the REST read/write workloads never do).
+    const gitMatch = pathname.indexOf('.git/') < 0
+      ? null
+      : /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(pathname);
     if (gitMatch) {
       const owner = decodeURIComponent(gitMatch[1]);
       const repoName = decodeURIComponent(gitMatch[2]);
